@@ -39,24 +39,15 @@ function nll(y, X, theta, gs)
   return sum(map(choicenll, chunk(y, size = mlg), chunk(deltas, size = mlg)))
 end
 
-# main user-facing function
-function estimate_logit(fm, data)
-  af = apply_schema(fm, schema(fm, data))
-  y, Xd = modelcols(af, data)
+# something like this?
+function hnll(y, X, Z, theta, gamma, gs)
+  deltas = mvprod(X, theta) .* exp.(mvprod(Z, gamma))
+  mlg = map(length, gs)
+  return sum(map(choicenll, chunk(y, size = mlg), chunk(deltas, size = mlg)))
+end
 
-  parameter_names = coefnames(af)[2]
-
-  Xs = sparse(onehotbatch(data.TY, sort(unique(data.TY)))')
-  Xs = Xs[:, 2:end]
-
-  choicefe_names = sort(unique(data.TY))[2:end]
-
-  X = hcat(Xd, Xs)
-  gs = collect(groupinds(data.logitID))
-
-  theta0 = randn(size(X, 2))
-
-  obj(theta) = nll(y, X, theta, gs)
+# sets up the nlp and solves it
+function logit_solve(obj, theta0)
   grad(theta) = Zygote.gradient(obj, theta)[1]
   Hv(theta, v) = ForwardDiff.derivative(a -> grad(theta .+ a .* v), 0.0)
 
@@ -72,11 +63,55 @@ function estimate_logit(fm, data)
 
   nlp = NLPModel(theta0, obj, grad = grad!, hprod = Hv!)
 
-  result = trunk(nlp, verbose = 1, max_time = 600.0)
-  theta_star = result.solution
+  return trunk(nlp, verbose = 1, max_time = 600.0)
+end
+
+function inner_vanilla_logit(y, X, gs)
+  obj(theta) = nll(y, X, theta, gs)
+  theta0 = randn(size(X, 2))
+
+  return logit_solve(obj, theta0)
+end
+
+function inner_scale_logit(y, X, Z, gs)
+  K = size(X, 2)
+  L = size(Z, 2)
+  obj(theta) = hnll(y, X, Z, theta[1:K], theta[K+1:end], gs)
+  theta0 = randn(K + L)
+
+  return logit_solve(obj, theta0)
+end
+
+# main user-facing function
+function estimate_logit(fm, data; scalefm = nothing)
+  # all of this stuff has to happen for any model
+  af = apply_schema(fm, schema(fm, data))
+  y, Xd = modelcols(af, data)
+
+  Xs = sparse(onehotbatch(data.TY, sort(unique(data.TY)))')
+  Xs = Xs[:, 2:end]
+
+  X = hcat(Xd, Xs)
+  gs = collect(groupinds(data.logitID))
+
+  choicefe_names = sort(unique(data.TY))[2:end]
+  parameter_names = String.(coefnames(af)[2])
+
+  if !isnothing(scalefm)
+    af_scale = apply_schema(scalefm, schema(scalefm, data))
+    nothing, Z = modelcols(af_scale, data)
+    solution = inner_scale_logit(y, X, Z, gs)
+    scale_parameter_names = String.(coefnames(af_scale)[2])
+    scale_parameter_names = "Scale_" .* scale_parameter_names
+    parameter_names = vcat(parameter_names, scale_parameter_names)
+  else
+    solution = inner_vanilla_logit(y, X, gs)
+  end
+
+  theta_star = solution.solution
 
   return DataFrame(
-    parameter = vcat(String.(parameter_names), choicefe_names),
+    parameter = vcat(parameter_names, choicefe_names),
     pointest = theta_star
   )
 end
